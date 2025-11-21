@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+aiohttp
+async-timeout
+beautifulsoup4
+lxml

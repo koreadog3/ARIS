@@ -93,29 +93,52 @@ def quick_filter(text: str) -> bool:
 
 # -------------------------
 # RISK 시그널 정의 (버킷/패턴/가중치)
+#  - EN + KO 혼합 강화판
 # -------------------------
 SIGNAL_DEFS = {
     "military": {
+        # EN
         r"(missile|rocket|drone|airstrike|bombing|shelling|artillery|cluster\s+munitions?)": 3,
         r"(invasion|offensive|counteroffensive|frontline|battle|combat|war\b|conflict\b)": 2,
         r"(mobilization|conscription|martial\s+law|state\s+of\s+emergency)": 2,
+        # KO
+        r"(미사일|로켓|드론|공습|폭격|포격|포탄|다연장|대공포|군사훈련|실사격|훈련\s*강화|무력\s*시위)": 3,
+        r"(침공|공세|반격|전선|교전|전투|전쟁|무력충돌|충돌|교전\s*확대)": 2,
+        r"(동원령|징집|예비군\s*소집|계엄|비상사태|준전시|전시태세|전투태세\s*격상)": 2,
     },
     "diplomacy": {
+        # EN
         r"(ceasefire|peace\s+talks?|negotiations?|summit|envoy)": 1,
         r"(sanctions?|embargo|export\s+controls?)": 1,
         r"(expel|recall).{0,20}(ambassador|diplomat)": 2,
+        # KO
+        r"(휴전|평화회담|협상|정상회담|특사|중재|대화\s*재개)": 1,
+        r"(제재|금수|수출통제|경제\s*제재|무역\s*제한)": 1,
+        r"(대사|외교관).{0,20}(추방|소환|철수|귀국\s*명령)": 2,
     },
     "civil": {
+        # EN
         r"(protest|riot|unrest|curfew|violent\s+clashes?)": 2,
         r"(terror(ism|ist)?\b|bomb\s+threat|hostage)": 3,
         r"(mass\s+evacuation|displacement|refugee\s+flow)": 2,
+        # KO
+        r"(시위|폭동|소요|불안|통행금지|유혈충돌|치안\s*불안)": 2,
+        r"(테러|폭탄\s*위협|인질|총격|자폭|폭발\s*사건)": 3,
+        r"(대규모\s*대피|피란|난민|탈출행렬|피난민\s*급증)": 2,
     },
     "economy": {
+        # EN
         r"(currency|FX|exchange\s+rate).{0,20}(crash|collapse|plunge|spike)": 1,
         r"(oil|gas|energy).{0,20}(disruption|cut|halt|shock)": 1,
         r"(항공편|항공\s*편|flights?).{0,40}(대량|mass|wide|many).{0,20}(취소|cancel)": 1,
         r"(보험|war risk).{0,20}(할증|premium|spike)": 1,
         r"(해운|항만).{0,20}(중단|지연|적체)": 1,
+        # KO
+        r"(환율|외환).{0,20}(급락|폭락|급등|불안|패닉|쇼크)": 1,
+        r"(유가|가스|에너지).{0,20}(차질|중단|충격|급등|공급\s*차단)": 1,
+        r"(항공편).{0,20}(결항|취소|대규모\s*취소|운항\s*중단)": 1,
+        r"(전쟁보험|워리스크).{0,20}(할증|급등|프리미엄\s*상승)": 1,
+        r"(해운|항만).{0,20}(마비|중단|지연|적체|봉쇄)": 1,
     },
 }
 
@@ -379,8 +402,13 @@ def pick_best_link(item) -> str:
             return href
     return extract_link(item)
 
+# -------------------------
+# ★ 개선 1: 피드별 상한을 둔 RSS 수집
+# -------------------------
 async def search_news(session: aiohttp.ClientSession):
     items = []
+    PER_FEED_CAP = 30  # 피드 하나당 최대 N개까지만 (독식 방지)
+
     for url in NEWS_FEEDS:
         xml = await fetch_text(session, url)
         if not xml:
@@ -390,8 +418,9 @@ async def search_news(session: aiohttp.ClientSession):
         except Exception as e:
             print(f"[RSS PARSE ERROR] {url} {repr(e)}")
             continue
-        items.extend(soup.find_all("item"))
-        items.extend(soup.find_all("entry"))
+
+        feed_items = (soup.find_all("item") or []) + (soup.find_all("entry") or [])
+        items.extend(feed_items[:PER_FEED_CAP])
 
     norm = []
     for it in items:
@@ -478,6 +507,38 @@ async def summarize_translate_ews(title: str, body: str) -> str:
         return ""
 
 # -------------------------
+# ★ 개선 2: 도메인(언론사) 다양성 강제 선택
+# -------------------------
+def _domain_of(link: str) -> str:
+    try:
+        return urlparse(link).netloc.lower() or "unknown"
+    except Exception:
+        return "unknown"
+
+def diversify_items(rss_items, cap_total=80, domain_cap=10):
+    """
+    시간순 리스트에서 도메인(언론사)별 상한을 걸어
+    특정 언론이 top N을 독식하지 못하게 하는 선택기.
+    """
+    selected = []
+    domain_count = defaultdict(int)
+
+    for it in rss_items:
+        link = pick_best_link(it)
+        dom = _domain_of(link)
+
+        if domain_count[dom] >= domain_cap:
+            continue
+
+        selected.append(it)
+        domain_count[dom] += 1
+
+        if len(selected) >= cap_total:
+            break
+
+    return selected
+
+# -------------------------
 # 핵심 1회 실행
 # -------------------------
 async def run_once():
@@ -497,7 +558,10 @@ async def run_once():
             print("[RUN_ONCE ERROR] search_news", repr(e))
             rss_items = []
 
-        for item in rss_items[:80]:
+        # ★ 개선 2 적용: 언론사 섞어서 최대 80개만 추림
+        rss_items = diversify_items(rss_items, cap_total=80, domain_cap=10)
+
+        for item in rss_items:
             try:
                 title_node = item.find("title")
                 title = title_node.text.strip() if title_node and title_node.text else ""
@@ -601,6 +665,8 @@ async def run_once():
                 continue
 
     return ews_events, risk_events
+
+
 
 
 

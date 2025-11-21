@@ -1,6 +1,7 @@
 # ews_core.py
 import re
 import json
+import os
 import aiohttp
 import async_timeout
 from bs4 import BeautifulSoup
@@ -8,6 +9,7 @@ from urllib.parse import urlparse
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
 from math import exp
+from openai import AsyncOpenAI
 
 # -------------------------
 # 기본 설정
@@ -18,8 +20,7 @@ UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 KST = timezone(timedelta(hours=9))
 
 # -------------------------
-# 뉴스 피드 목록
-#  - 404 적고, 국제/정치/사회 위주
+# 뉴스 피드 목록 (404 적은 것 위주로 정리)
 # -------------------------
 NEWS_FEEDS = [
     # KR - 경향신문
@@ -33,7 +34,7 @@ NEWS_FEEDS = [
     "https://www.hani.co.kr/rss/international/",
     "https://www.hani.co.kr/rss/politics/",
 
-    # KR - 연합뉴스 (섹션 RSS)
+    # KR - 연합뉴스(섹션)
     "https://www.yna.co.kr/rss/politics.xml",
     "https://www.yna.co.kr/rss/international.xml",
     "https://www.yna.co.kr/rss/northkorea.xml",
@@ -48,12 +49,9 @@ NEWS_FEEDS = [
 ]
 
 # -------------------------
-# EWS 필터
-#  - 조건: (대사관/공관 + 철수/대피/폐쇄 등 행동)
-#        + (주한/서울/한국/대한민국/South Korea/Seoul 등 위치)
-#  - 한국 대사관(=대한민국이 해외에 둔 공관) 철수는 기본 제외
+# EWS 필터 (★주한 외국공관 철수만)
+#  - 행동(철수/대피/폐쇄 등) + 한국/주한(장소) 동시 만족
 # -------------------------
-
 EWS_ACTION = re.compile(
     r"(?i)("
     r"embassy\s+(withdraw|evacuate|evacuation|pull\s*out|close|closure|shutdown|suspend)"
@@ -73,7 +71,7 @@ EWS_KOREA_CTX = re.compile(
     r")"
 )
 
-# 한국 대사관(=대한민국 공관)이 해외에서 철수하는 케이스를 가려내기 위한 패턴
+# "대한민국 대사관 철수(=해외 공관 철수)"는 제외하기 위한 패턴
 EWS_KOREA_NEG = re.compile(
     r"(?i)("
     r"Korean\s+embassy|ROK\s+embassy|Republic\s+of\s+Korea\s+embassy|"
@@ -85,20 +83,12 @@ def quick_filter(text: str) -> bool:
     """주한 외국공관 철수/대피/폐쇄에 해당하는 경우만 True."""
     if not text:
         return False
-
-    # 1) 행동 패턴
     if not EWS_ACTION.search(text):
         return False
-
-    # 2) 한국(서울/주한 등) 위치 패턴
     if not EWS_KOREA_CTX.search(text):
         return False
-
-    # 3) 한국 대사관(대한민국 공관)이 해외에서 철수하는 경우 기본 제외
-    #    단, 문맥에 '주한'이 함께 있으면 그대로 허용
     if EWS_KOREA_NEG.search(text) and "주한" not in text:
         return False
-
     return True
 
 # -------------------------
@@ -129,7 +119,6 @@ SIGNAL_DEFS = {
     },
 }
 
-# 노이즈(넷플릭스, 스포츠, 범죄물 등) 필터
 NEG_RISK_FILTER = re.compile(
     r"(?i)("
     r"Netflix|film|movie|series|documentary|biopic|drama|trailer|episode|season|box\s*office|"
@@ -140,7 +129,7 @@ NEG_RISK_FILTER = re.compile(
 )
 
 def extract_signals(text: str) -> dict[str, int]:
-    """본문에서 군사/외교/민간/경제 시그널을 추출해서 버킷별 점수로 반환."""
+    """본문에서 군사/외교/민간/경제 시그널을 추출."""
     found: dict[str, int] = defaultdict(int)
     if not text:
         return found
@@ -149,8 +138,7 @@ def extract_signals(text: str) -> dict[str, int]:
         bucket_score = 0
         for pat, w in rules.items():
             if re.search(pat, text, flags=re.IGNORECASE):
-                # 같은 버킷 내에서는 최댓값만 사용 (중복 매칭 과대평가 방지)
-                bucket_score = max(bucket_score, w)
+                bucket_score = max(bucket_score, w)  # 버킷 내 최댓값
         if bucket_score > 0:
             found[bucket] = bucket_score
     return found
@@ -166,7 +154,7 @@ COUNTRY_CANON = {
     "North Korea":"North Korea","United States":"United States","United Kingdom":"United Kingdom",
     "France":"France","Germany":"Germany","Turkey":"Turkey","Iran":"Iran","Iraq":"Iraq",
     "Israel":"Israel","Lebanon":"Lebanon","Syria":"Syria","Saudi Arabia":"Saudi Arabia",
-    "United Arab Emirates":"United Arab Emirates","Qatar":"Qatar","Egypt":"Egypt", "Vietnam":"Vietnam",
+    "United Arab Emirates":"United Arab Emirates","Qatar":"Qatar","Egypt":"Egypt","Vietnam":"Vietnam",
     "Sudan":"Sudan","South Sudan":"South Sudan","Myanmar":"Myanmar","Thailand":"Thailand",
     "Philippines":"Philippines","Indonesia":"Indonesia","Malaysia":"Malaysia","Singapore":"Singapore",
     "Australia":"Australia","Canada":"Canada","Mexico":"Mexico","Brazil":"Brazil","Argentina":"Argentina",
@@ -179,7 +167,7 @@ COUNTRY_CANON = {
     "Serbia":"Serbia","Croatia":"Croatia","Slovenia":"Slovenia","Denmark":"Denmark","Portugal":"Portugal",
     "Ireland":"Ireland","New Zealand":"New Zealand",
 
-    # KO 매핑
+    # KO
     "러시아":"Russia","우크라이나":"Ukraine","폴란드":"Poland","벨라루스":"Belarus",
     "아르메니아":"Armenia","아제르바이잔":"Azerbaijan","인도":"India","파키스탄":"Pakistan",
     "중국":"China","대만":"Taiwan","일본":"Japan","대한민국":"South Korea","한국":"South Korea",
@@ -240,10 +228,9 @@ def extract_country_pairs(title: str, body: str):
 # -------------------------
 def compute_risk_score(signals: dict[str, int], hours_ago: float, repeated_bonus: float = 0.0) -> float:
     raw = sum(signals.values()) + repeated_bonus
-    decay = exp(-hours_ago / 48.0)  # 대략 2일 스케일 감쇠
+    decay = exp(-hours_ago / 48.0)
     score = raw * decay
-    score = max(0.0, min(10.0, score))
-    return score
+    return max(0.0, min(10.0, score))
 
 def band_from_score(score: float) -> str:
     if score >= 7.0:
@@ -255,7 +242,7 @@ def band_from_score(score: float) -> str:
     return "낮음"
 
 # -------------------------
-# 반복/에스컬레이션 보너스
+# 반복 보너스
 # -------------------------
 signal_history: dict[str, deque] = defaultdict(lambda: deque(maxlen=64))
 
@@ -268,7 +255,7 @@ def repeated_bonus(country: str, now: datetime) -> float:
     return min(2.0, bonus)
 
 # -------------------------
-# HTML → 텍스트 유틸
+# HTML → 텍스트
 # -------------------------
 def html_to_text(html: str) -> str:
     if not html:
@@ -286,8 +273,7 @@ def html_to_text(html: str) -> str:
         ".content__article-body",
         ".content",
     ]:
-        found = soup.select(sel)
-        candidates.extend(found)
+        candidates.extend(soup.select(sel) or [])
 
     def clean(node):
         for bad in node.find_all(
@@ -310,19 +296,14 @@ def html_to_text(html: str) -> str:
     return " ".join(soup.get_text(" ", strip=True).split())
 
 # -------------------------
-# 네트워크 fetch (서버 친화형)
+# 네트워크 fetch
 # -------------------------
 async def fetch_text(session: aiohttp.ClientSession, url: str) -> str:
     if not url:
         return ""
     try:
         async with async_timeout.timeout(REQUEST_TIMEOUT):
-            async with session.get(
-                url,
-                headers=UA,
-                allow_redirects=True,
-                ssl=False,
-            ) as resp:
+            async with session.get(url, headers=UA, allow_redirects=True, ssl=False) as resp:
                 if resp.status >= 400:
                     print(f"[FETCH FAIL] {resp.status} {url}")
                     return ""
@@ -389,7 +370,6 @@ def extract_link(item) -> str:
     return link
 
 def pick_best_link(item) -> str:
-    # Atom/RDF에서 HTML 기사 링크 우선
     links = item.find_all("link") or []
     for ln in links:
         href = ln.get("href") or (ln.string.strip() if ln.string else "")
@@ -423,12 +403,6 @@ async def search_news(session: aiohttp.ClientSession):
     norm.sort(key=lambda x: x[0], reverse=True)
     return [it for _, it in norm]
 
-def source_domain(url: str) -> str:
-    try:
-        return urlparse(url).hostname or ""
-    except Exception:
-        return ""
-
 # -------------------------
 # dedupe (48h)
 # -------------------------
@@ -443,6 +417,65 @@ def _purge_seen(now: datetime):
     for fp, exp in list(seen_fp_expiry.items()):
         if exp <= now:
             seen_fp_expiry.pop(fp, None)
+
+# -------------------------
+# AI 요약/번역 (EWS 전용) - GPT-5 Nano 고정
+# -------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = "gpt-5-nano"
+
+_ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+def looks_english(s: str) -> bool:
+    if not s:
+        return False
+    letters = sum(c.isascii() and c.isalpha() for c in s)
+    korean = sum("가" <= c <= "힣" for c in s)
+    return letters > max(40, korean * 2)
+
+async def summarize_translate_ews(title: str, body: str) -> str:
+    """GPT-5-nano로 번역 포함 3줄 요약 + 경보 1줄."""
+    if not _ai_client:
+        return ""
+
+    try:
+        text = (body or "")[:4000]
+
+        prompt = f"""
+다음은 '주한 외국공관 철수/대피/폐쇄/여행경보 상향'과 관련될 수 있는 기사입니다.
+
+요구사항:
+1) 한국어로 자연스럽게 번역한 요약을 3줄 이내로 작성하세요.
+2) 정말로 주한 공관 철수/대피/폐쇄/여행경보 상향이 핵심이면 마지막에
+   '경보: ...' 형식으로 한 줄 더 붙이세요.
+3) 불확실하면 '경보: 판단 보류'로 적으세요.
+4) 과장하지 말고 기사 근거만 사용하세요.
+
+제목: {title}
+본문: {text}
+""".strip()
+
+        resp = await _ai_client.responses.create(
+            model=OPENAI_MODEL,
+            input=prompt,
+            reasoning={"effort": "minimal"},
+            text={"verbosity": "low"},
+            max_output_tokens=320,
+            temperature=0.2,
+        )
+
+        out_text = ""
+        for item in getattr(resp, "output", []) or []:
+            if getattr(item, "type", "") == "message":
+                for c in getattr(item, "content", []) or []:
+                    if getattr(c, "type", "") == "output_text":
+                        out_text += c.text
+
+        return out_text.strip()
+
+    except Exception as e:
+        print("[AI SUMMARY FAIL]", repr(e))
+        return ""
 
 # -------------------------
 # 핵심 1회 실행
@@ -464,7 +497,6 @@ async def run_once():
             print("[RUN_ONCE ERROR] search_news", repr(e))
             rss_items = []
 
-        # 최신 기사부터 최대 80개만 스캔
         for item in rss_items[:80]:
             try:
                 title_node = item.find("title")
@@ -480,10 +512,8 @@ async def run_once():
 
                 pub = parse_pubdate(item)
                 if (now - pub).total_seconds() > 72 * 3600:
-                    # 72시간 이상 지난 기사 버림
                     continue
 
-                # 기사 본문 → 부족하면 RSS summary로 보완
                 article_html = await fetch_text(session, link)
                 article_text = html_to_text(article_html) if article_html else ""
                 if len(article_text) < 200:
@@ -495,21 +525,25 @@ async def run_once():
 
                 blob = f"{title}\n{article_text}"
 
-                # ---- EWS (주한 공관 철수) ----
+                # ---- EWS ----
                 if quick_filter(blob):
                     keys = extract_country_keys(title, article_text, top_k=2)
                     keys = [k for k in keys if k != "미상"]
+
+                    summary = ""
+                    if looks_english(blob):
+                        summary = await summarize_translate_ews(title, article_text)
 
                     ews_events.append({
                         "pub": pub.isoformat(),
                         "title": title,
                         "link": link,
                         "countries": keys or ["미상"],
-                        "summary": "",
+                        "summary": summary
                     })
 
                     seen_fp_expiry[fp] = now + timedelta(hours=DEDUP_HOURS)
-                    continue  # EWS로 처리되면 RISK에는 안 넣음
+                    continue
 
                 # ---- RISK ----
                 signals = extract_signals(blob)
@@ -518,12 +552,10 @@ async def run_once():
 
                 strong = (sum(signals.values()) >= 3) or (signals.get("military", 0) >= 3)
                 if NEG_RISK_FILTER.search(title) and not strong:
-                    # 제목이 엔터/스포츠/범죄물 느낌이면 강한 군사신호 없으면 버림
                     continue
 
                 total_sig = sum(signals.values())
                 multi_bucket = sum(1 for v in signals.values() if v > 0) >= 2
-                # 너무 약한 시그널은 버림
                 if not (strong or multi_bucket or total_sig >= 2):
                     continue
 
@@ -546,10 +578,9 @@ async def run_once():
                             "key": key,
                             "score": float(score),
                             "band": band,
-                            "signals": json.dumps(signals, ensure_ascii=False),
+                            "signals": json.dumps(signals, ensure_ascii=False)
                         })
                 else:
-                    # 국가쌍을 못 잡으면 key=미상으로라도 남김
                     score = compute_risk_score(signals, hours_ago, 0.0)
                     band = band_from_score(score)
                     risk_events.append({
@@ -559,7 +590,7 @@ async def run_once():
                         "key": "미상",
                         "score": float(score),
                         "band": band,
-                        "signals": json.dumps(signals, ensure_ascii=False),
+                        "signals": json.dumps(signals, ensure_ascii=False)
                     })
 
                 if ews_events or risk_events:
@@ -570,6 +601,8 @@ async def run_once():
                 continue
 
     return ews_events, risk_events
+
+
 
 
 

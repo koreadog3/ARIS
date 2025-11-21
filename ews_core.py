@@ -307,13 +307,15 @@ async def fetch_text(session: aiohttp.ClientSession, url: str, is_rss: bool = Fa
     # RSS/HTML 공통 fetch, 2회 재시도
     for attempt in range(2):
         try:
-            with async_timeout.timeout(REQUEST_TIMEOUT):
+            # ❗ 여기: with -> async with 로 고침
+            async with async_timeout.timeout(REQUEST_TIMEOUT):
                 async with session.get(url, headers=UA, allow_redirects=True) as resp:
                     if resp.status != 200:
                         tag = "RSS" if is_rss else "FETCH"
                         print(f"[{tag} FAIL] {resp.status} {url}")
                         return ""
                     return await resp.text()
+
         except Exception as e:
             if attempt == 0:
                 await asyncio.sleep(0.6)
@@ -321,7 +323,9 @@ async def fetch_text(session: aiohttp.ClientSession, url: str, is_rss: bool = Fa
             tag = "RSS" if is_rss else "FETCH"
             print(f"[{tag} ERROR] {url} {repr(e)}")
             return ""
+
     return ""
+
 
 def rss_snippet(item) -> str:
     candidates = []
@@ -532,6 +536,7 @@ async def run_once():
                 continue
 
     return ews_events, risk_events
+
 
 
 

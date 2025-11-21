@@ -4,3 +4,5 @@ aiohttp
 async-timeout
 beautifulsoup4
 lxml
+python-dotenv
+openai

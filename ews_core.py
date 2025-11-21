@@ -87,7 +87,7 @@ NEG_RISK_FILTER = re.compile(
     r"Netflix|film|movie|series|documentary|biopic|drama|trailer|episode|season|box\s*office|"
     r"celebrity|entertainment|interview|review|feature|opinion|"
     r"sports?|match|tournament|league|"
-    r"crime|killer|murder|manhunt|cold\s*case|serial\s*killer|police\s*case|detective"
+    r"crime|killer|murder|manhunt|cold\s*case|serial\s+killer|police\s*case|detective"
     r")\b"
 )
 
@@ -328,14 +328,29 @@ def html_to_text(html: str) -> str:
 
     return " ".join(soup.get_text(" ", strip=True).split())
 
+# -------------------------
+# 네트워크 fetch (서버 친화형)
+# -------------------------
 async def fetch_text(session: aiohttp.ClientSession, url: str) -> str:
+    if not url:
+        return ""
     try:
-        with async_timeout.timeout(REQUEST_TIMEOUT):
-            async with session.get(url, headers=UA, allow_redirects=True) as resp:
-                if resp.status != 200:
+        async with async_timeout.timeout(REQUEST_TIMEOUT):
+            async with session.get(
+                url,
+                headers=UA,
+                allow_redirects=True,
+                ssl=False,  # ⭐ 서버 환경에서 SSL/차단 이슈 완화
+            ) as resp:
+                if resp.status >= 400:
+                    print(f"[FETCH FAIL] {resp.status} {url}")
                     return ""
-                return await resp.text()
-    except Exception:
+                text = await resp.text(errors="ignore")
+                if not text.strip():
+                    print(f"[FETCH EMPTY] {url}")
+                return text
+    except Exception as e:
+        print(f"[FETCH ERROR] {url} {repr(e)}")
         return ""
 
 def rss_snippet(item) -> str:
@@ -451,7 +466,10 @@ async def run_once():
     now = datetime.now(KST)
     _purge_seen(now)
 
-    async with aiohttp.ClientSession() as session:
+    # ⭐ 세션을 서버 친화적으로 생성
+    connector = aiohttp.TCPConnector(ssl=False)
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         rss_items = await search_news(session)
 
         for item in rss_items[:80]:
@@ -478,7 +496,6 @@ async def run_once():
 
             if not article_text:
                 article_text = title
-
 
             if not article_text:
                 continue
@@ -556,3 +573,5 @@ async def run_once():
                 seen_fp_expiry[fp] = now + timedelta(hours=DEDUP_HOURS)
 
     return ews_events, risk_events
+
+

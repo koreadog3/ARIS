@@ -18,20 +18,30 @@ UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 KST = timezone(timedelta(hours=9))
 
 NEWS_FEEDS = [
-    # KR
+    # KR - 경향신문(공식 RSS)
     "https://www.khan.co.kr/rss/rssdata/politic_news.xml",
-    "https://www.khan.co.kr/rss/rssdata/national_news.xml",
-    "https://www.yna.co.kr/rss/search.xml?query=%EC%B2%A0%EC%88%98",
-    "https://www.yna.co.kr/rss/search.xml?query=%EB%8C%80%EC%82%AC%EA%B4%80",
-    "https://www.yna.co.kr/rss/search.xml?query=%EB%8C%80%ED%94%BC",
-    "https://www.yna.co.kr/rss/search.xml?query=%EA%B8%B4%EA%B8%89%20%EC%B2%A0%EC%88%98",
+    "https://www.khan.co.kr/rss/rssdata/society_news.xml",
+    "https://www.khan.co.kr/rss/rssdata/kh_world.xml",
+    "https://www.khan.co.kr/rss/rssdata/total_news.xml",
+
+    # KR - 한겨레(공식 RSS)
+    "http://www.hani.co.kr/rss/",
+    "https://www.hani.co.kr/rss/international/",
+    "https://www.hani.co.kr/rss/politics/",
+
+    # KR - 연합뉴스(섹션 RSS로 교체)
+    "https://www.yna.co.kr/rss/politics.xml",
+    "https://www.yna.co.kr/rss/international.xml",
+    "https://www.yna.co.kr/rss/northkorea.xml",
+    "https://www.yna.co.kr/rss/society.xml",
+
     # EN / INTL
-    "https://www.reutersagency.com/feed/?best-topics=world",
     "https://feeds.bbci.co.uk/news/world/rss.xml",
     "https://www.aljazeera.com/xml/rss/all.xml",
     "https://www.theguardian.com/world/rss",
-    "https://www.dw.com/en/top-stories/rss",
+    "https://rss.dw.com/rdf/rss-en-top",
     "https://www.france24.com/en/rss",
+
 ]
 
 # -------------------------
@@ -573,5 +583,6 @@ async def run_once():
                 seen_fp_expiry[fp] = now + timedelta(hours=DEDUP_HOURS)
 
     return ews_events, risk_events
+
 
 

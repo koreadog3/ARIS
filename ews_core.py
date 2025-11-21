@@ -16,8 +16,7 @@ from bs4 import BeautifulSoup
 # 기본 설정
 # -------------------------
 REQUEST_TIMEOUT = 15
-MAX_RSS_SCAN = 120          # RSS에서 최대 몇 개 아이템까지 훑을지
-MAX_ARTICLE_FETCH = 80      # 실제 기사 본문/요약 분석할 최대 개수
+MAX_RSS_SCAN = 120
 DEDUP_HOURS = 48
 
 UA = {
@@ -30,45 +29,37 @@ UA = {
 
 KST = timezone(timedelta(hours=9))
 
-# -------------------------
-# RSS 피드 목록
-# - 서버에서 404/차단 잦은 것(ReutersAgency/DW/연합뉴스 검색식 등)은 기본 제외
-# - 안정 피드 + Google News 키워드 RSS로 대체
-# -------------------------
 NEWS_FEEDS = [
-    # KR (정치/외교 관련)
-    "https://www.khan.co.kr/rss/rssdata/politic_news.xml",   # 경향 정치 (공식 RSS)
-    "https://www.khan.co.kr/rss/rssdata/total_news.xml",     # 경향 전체
+    # KR
+    "https://www.khan.co.kr/rss/rssdata/politic_news.xml",
+    "https://www.khan.co.kr/rss/rssdata/total_news.xml",
 
-    # Google News (한국 키워드 검색 RSS)
-    # ※ 키워드 추가/수정은 여기에서 하시면 됩니다.
+    # Google News 키워드 RSS
     "https://news.google.com/rss/search?q=%EC%A3%BC%ED%95%9C%20%EB%8C%80%EC%82%AC%EA%B4%80%20%EC%B2%A0%EC%88%98&hl=ko&gl=KR&ceid=KR:ko",
     "https://news.google.com/rss/search?q=%EB%8C%80%EC%82%AC%EA%B4%80%20%EC%97%85%EB%AC%B4%20%EC%A4%91%EB%8B%A8&hl=ko&gl=KR&ceid=KR:ko",
     "https://news.google.com/rss/search?q=%EC%97%AC%ED%96%89%EA%B2%BD%EB%B3%B4%20%EA%B2%A9%EC%83%81%20%ED%95%9C%EA%B5%AD&hl=ko&gl=KR&ceid=KR:ko",
 
-    # EN / INTL (안정적인 공개 RSS)
+    # EN / INTL
     "https://feeds.bbci.co.uk/news/world/rss.xml",
     "https://www.aljazeera.com/xml/rss/all.xml",
     "https://www.theguardian.com/world/rss",
     "https://www.france24.com/en/rss",
 
-    # 한겨레:온 RSS (공식 RSS 허브)
+    # 한겨레 RSS 허브(본문 403 많아서 RSS 요약만 쓰게 됨)
     "https://www.hanion.co.kr/rss/S1N1.xml",
     "https://www.hanion.co.kr/rss/S1N2.xml",
     "https://www.hanion.co.kr/rss/S1N3.xml",
 ]
 
 # -------------------------
-# EWS 필터 강화:
-# 1) 공관/대사관/외교용어 + 철수/대피/업무중단
-# 2) "주한/서울/한국 내" 맥락이 반드시 있어야 EWS
+# EWS 필터(강화판)
 # -------------------------
 EMBASSY_TERMS = re.compile(
     r"(?i)\b(embassy|consulate|mission|diplomat(s)?|ambassador|foreign\s+mission|대사관|영사관|공관|대표부|외교관|대사)\b"
 )
 WITHDRAW_TERMS = re.compile(
     r"(?i)\b(withdraw|pull\s*out|evacuate|evacuation|leave|relocate|close|suspend|shutdown|"
-    r"철수|대피|폐쇄|휴관|업무\s*중단|잠정\s*중단|철거|이전|철수령|대피령)\b"
+    r"철수|대피|폐쇄|휴관|업무\s*중단|잠정\s*중단|이전|철수령|대피령)\b"
 )
 KOREA_CONTEXT = re.compile(
     r"(?i)\b("
@@ -77,7 +68,6 @@ KOREA_CONTEXT = re.compile(
     r"in\s+south\s+korea|in\s+the\s+republic\s+of\s+korea|south\s*korean\s*capital"
     r")\b"
 )
-# EWS에 오탐을 만들기 쉬운 표현(다른 나라 공관 철수) 최소 차단
 NON_KOREA_EMBASSY_HINT = re.compile(
     r"(?i)\b(embassy\s+in\s+baghdad|embassy\s+in\s+kyiv|embassy\s+in\s+tehran|embassy\s+in\s+beirut|"
     r"미\s*대사관\s*\(?바그다드\)?|키이우\s*주재\s*대사관|테헤란\s*주재\s*대사관)\b"
@@ -89,7 +79,6 @@ def is_ews_event(title: str, body: str) -> bool:
         return False
     if not KOREA_CONTEXT.search(blob):
         return False
-    # 한국 맥락이 있어도 “다른 나라 공관 철수” 힌트가 강하면 EWS 제외
     if NON_KOREA_EMBASSY_HINT.search(blob) and not re.search(r"(주한|서울)", blob):
         return False
     return True
@@ -139,7 +128,7 @@ def extract_signals(text: str) -> dict[str, int]:
         bucket_score = 0
         for pat, w in rules.items():
             if re.search(pat, text, flags=re.IGNORECASE):
-                bucket_score = max(bucket_score, w)  # 합산 대신 최댓값
+                bucket_score = max(bucket_score, w)
         if bucket_score > 0:
             found[bucket] = bucket_score
     return found
@@ -148,53 +137,23 @@ def extract_signals(text: str) -> dict[str, int]:
 # 나라 추출 (가볍게)
 # -------------------------
 COUNTRY_CANON = {
-    # EN
-    "Russia":"Russia","Ukraine":"Ukraine","Poland":"Poland","Belarus":"Belarus",
-    "Armenia":"Armenia","Azerbaijan":"Azerbaijan","India":"India","Pakistan":"Pakistan",
-    "China":"China","Taiwan":"Taiwan","Japan":"Japan","South Korea":"South Korea",
-    "North Korea":"North Korea","United States":"United States","United Kingdom":"United Kingdom",
-    "France":"France","Germany":"Germany","Turkey":"Turkey","Iran":"Iran","Iraq":"Iraq",
-    "Israel":"Israel","Lebanon":"Lebanon","Syria":"Syria","Saudi Arabia":"Saudi Arabia",
-    "United Arab Emirates":"United Arab Emirates","Qatar":"Qatar","Egypt":"Egypt", "Vietnam":"Vietnam",
-    "Sudan":"Sudan","South Sudan":"South Sudan","Myanmar":"Myanmar","Thailand":"Thailand",
-    "Philippines":"Philippines","Indonesia":"Indonesia","Malaysia":"Malaysia","Singapore":"Singapore",
-    "Australia":"Australia","Canada":"Canada","Mexico":"Mexico","Brazil":"Brazil","Argentina":"Argentina",
-    "Chile":"Chile","Peru":"Peru","Colombia":"Colombia","Venezuela":"Venezuela","Nigeria":"Nigeria",
-    "Ethiopia":"Ethiopia","Kenya":"Kenya","Tanzania":"Tanzania","Uganda":"Uganda","Somalia":"Somalia",
-    "Libya":"Libya","Tunisia":"Tunisia","Algeria":"Algeria","Morocco":"Morocco","Spain":"Spain",
-    "Italy":"Italy","Greece":"Greece","Sweden":"Sweden","Norway":"Norway","Finland":"Finland",
-    "Netherlands":"Netherlands","Belgium":"Belgium","Switzerland":"Switzerland","Austria":"Austria",
-    "Czechia":"Czechia","Slovakia":"Slovakia","Hungary":"Hungary","Romania":"Romania",
-    "Bulgaria":"Bulgaria","Serbia":"Serbia","Croatia":"Croatia","Slovenia":"Slovenia",
-    "Denmark":"Denmark","Portugal":"Portugal","Ireland":"Ireland","New Zealand":"New Zealand",
+    "Russia":"Russia","Ukraine":"Ukraine","China":"China","Taiwan":"Taiwan","Japan":"Japan",
+    "South Korea":"South Korea","North Korea":"North Korea","United States":"United States",
+    "United Kingdom":"United Kingdom","France":"France","Germany":"Germany","Israel":"Israel",
+    "Iran":"Iran","Iraq":"Iraq","Syria":"Syria","Lebanon":"Lebanon","Vietnam":"Vietnam",
+    "Sudan":"Sudan","Myanmar":"Myanmar","Thailand":"Thailand",
 
-    # KO
-    "러시아":"Russia","우크라이나":"Ukraine","폴란드":"Poland","벨라루스":"Belarus",
-    "아르메니아":"Armenia","아제르바이잔":"Azerbaijan","인도":"India","파키스탄":"Pakistan",
-    "중국":"China","대만":"Taiwan","일본":"Japan","대한민국":"South Korea","한국":"South Korea",
-    "북한":"North Korea","미국":"United States","영국":"United Kingdom","프랑스":"France",
-    "독일":"Germany","터키":"Turkey","튀르키예":"Turkey","이란":"Iran","이라크":"Iraq",
-    "이스라엘":"Israel","레바논":"Lebanon","시리아":"Syria","사우디아라비아":"Saudi Arabia",
-    "아랍에미리트":"United Arab Emirates","카타르":"Qatar","이집트":"Egypt","베트남":"Vietnam",
-    "수단":"Sudan","남수단":"South Sudan","미얀마":"Myanmar","태국":"Thailand",
-    "필리핀":"Philippines","인도네시아":"Indonesia","말레이시아":"Malaysia","싱가포르":"Singapore",
-    "호주":"Australia","캐나다":"Canada","멕시코":"Mexico","브라질":"Brazil","아르헨티나":"Argentina",
-    "칠레":"Chile","페루":"Peru","콜롬비아":"Colombia","베네수엘라":"Venezuela",
-    "나이지리아":"Nigeria","에티오피아":"Ethiopia","케냐":"Kenya","탄자니아":"Tanzania",
-    "우간다":"Uganda","소말리아":"Somalia","리비아":"Libya","튀니지":"Tunisia",
-    "알제리":"Algeria","모로코":"Morocco","스페인":"Spain","이탈리아":"Italy",
-    "그리스":"Greece","스웨덴":"Sweden","노르웨이":"Norway","핀란드":"Finland",
-    "네덜란드":"Netherlands","벨기에":"Belgium","스위스":"Switzerland","오스트리아":"Austria",
-    "체코":"Czechia","슬로바키아":"Slovakia","헝가리":"Hungary","루마니아":"Romania",
-    "불가리아":"Bulgaria","세르비아":"Serbia","크로아티아":"Croatia","슬로베니아":"Slovenia",
-    "덴마크":"Denmark","포르투갈":"Portugal","아일랜드":"Ireland","뉴질랜드":"New Zealand",
+    "러시아":"Russia","우크라이나":"Ukraine","중국":"China","대만":"Taiwan","일본":"Japan",
+    "대한민국":"South Korea","한국":"South Korea","북한":"North Korea","미국":"United States",
+    "영국":"United Kingdom","프랑스":"France","독일":"Germany","이스라엘":"Israel",
+    "이란":"Iran","이라크":"Iraq","시리아":"Syria","레바논":"Lebanon","베트남":"Vietnam",
+    "수단":"Sudan","미얀마":"Myanmar","태국":"Thailand",
 }
 ALIASES = {
     "ROK":"South Korea","Korea":"South Korea","Republic of Korea":"South Korea",
     "DPRK":"North Korea","U.S.":"United States","US":"United States","USA":"United States",
-    "UK":"United Kingdom","UAE":"United Arab Emirates","KSA":"Saudi Arabia",
+    "UK":"United Kingdom",
 }
-
 NAME_TOKEN = re.compile(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}|[가-힣]{2,10}")
 
 def extract_country_keys(title: str, body: str, top_k: int = 2) -> list[str]:
@@ -207,10 +166,8 @@ def extract_country_keys(title: str, body: str, top_k: int = 2) -> list[str]:
             t = ALIASES[t]
         if t in COUNTRY_CANON:
             found.append(COUNTRY_CANON[t])
-
     if not found:
         return ["미상"]
-
     freq = defaultdict(int)
     for c in found:
         freq[c] += 1
@@ -222,7 +179,7 @@ def extract_country_pairs(title: str, body: str):
     keys = [k for k in keys if k != "미상"]
     pairs = []
     for i in range(len(keys)):
-        for j in range(i + 1, len(keys)):
+        for j in range(i+1, len(keys)):
             pairs.append((keys[i], keys[j]))
     return pairs
 
@@ -242,7 +199,7 @@ def band_from_score(score: float) -> str:
     return "낮음"
 
 # -------------------------
-# 반복/에스컬레이션 보너스
+# 반복 보너스
 # -------------------------
 signal_history = defaultdict(lambda: deque(maxlen=64))
 
@@ -250,7 +207,7 @@ def repeated_bonus(country: str, now: datetime) -> float:
     hist = signal_history[country]
     bonus = 0.0
     for t, _ in hist:
-        if (now - t).total_seconds() <= 24 * 3600:
+        if (now - t).total_seconds() <= 24*3600:
             bonus += 0.5
     return min(2.0, bonus)
 
@@ -264,14 +221,8 @@ def html_to_text(html: str) -> str:
 
     candidates = []
     for sel in [
-        "article",
-        'div[itemprop="articleBody"]',
-        ".article-body",
-        ".article_content",
-        ".story-body",
-        ".paywall",
-        ".content__article-body",
-        ".content"
+        "article", 'div[itemprop="articleBody"]', ".article-body", ".article_content",
+        ".story-body", ".paywall", ".content__article-body", ".content"
     ]:
         candidates.extend(soup.select(sel))
 
@@ -291,54 +242,16 @@ def html_to_text(html: str) -> str:
 
     return " ".join(soup.get_text(" ", strip=True).split())
 
-# -------------------------
-# 네트워크 fetch (재시도 포함)
-# -------------------------
-def _host(url: str) -> str:
-    try:
-        return urlparse(url).hostname or ""
-    except Exception:
-        return ""
-
-# 한겨레 등 본문 403이 잦은 곳은 RSS 요약만 사용
-BLOCK_ARTICLE_DOMAINS = {"hani.co.kr", "hanion.co.kr"}
-
-async def fetch_text(session: aiohttp.ClientSession, url: str, is_rss: bool = False) -> str:
-    # RSS/HTML 공통 fetch, 2회 재시도
-    for attempt in range(2):
-        try:
-            # ❗ 여기: with -> async with 로 고침
-            async with async_timeout.timeout(REQUEST_TIMEOUT):
-                async with session.get(url, headers=UA, allow_redirects=True) as resp:
-                    if resp.status != 200:
-                        tag = "RSS" if is_rss else "FETCH"
-                        print(f"[{tag} FAIL] {resp.status} {url}")
-                        return ""
-                    return await resp.text()
-
-        except Exception as e:
-            if attempt == 0:
-                await asyncio.sleep(0.6)
-                continue
-            tag = "RSS" if is_rss else "FETCH"
-            print(f"[{tag} ERROR] {url} {repr(e)}")
-            return ""
-
-    return ""
-
-
 def rss_snippet(item) -> str:
     candidates = []
     for tag in ("content:encoded","content","description","summary","dc:description"):
         node = item.find(tag)
         if node and node.text:
             candidates.append(node.text.strip())
-
     for node in item.find_all(True):
         name = (node.name or "").lower()
         if any(name.endswith(x) for x in ("description","summary","encoded")) and node.text:
             candidates.append(node.text.strip())
-
     return max(candidates, key=len, default="")
 
 def parse_pubdate(item) -> datetime:
@@ -348,7 +261,6 @@ def parse_pubdate(item) -> datetime:
         if node and node.text:
             txt = node.text.strip()
             break
-
     fmts = [
         "%a, %d %b %Y %H:%M:%S %Z",
         "%a, %d %b %Y %H:%M:%S %z",
@@ -366,20 +278,6 @@ def parse_pubdate(item) -> datetime:
             continue
     return datetime.now(KST)
 
-def extract_link(item) -> str:
-    link = ""
-    lnode = item.find("link")
-    if lnode:
-        if getattr(lnode, "string", None):
-            link = lnode.string.strip()
-        elif lnode.get("href"):
-            link = lnode.get("href").strip()
-    if not link and item.find("guid"):
-        g = item.find("guid").text.strip()
-        if g.startswith("http"):
-            link = g
-    return link
-
 def pick_best_link(item) -> str:
     links = item.find_all("link") or []
     for ln in links:
@@ -388,7 +286,46 @@ def pick_best_link(item) -> str:
         typ  = (ln.get("type") or "").lower()
         if href.startswith("http") and (rel == "alternate" or "html" in typ):
             return href
-    return extract_link(item)
+    # fallback
+    lnode = item.find("link")
+    if lnode:
+        if getattr(lnode, "string", None):
+            return lnode.string.strip()
+        if lnode.get("href"):
+            return lnode.get("href").strip()
+    g = item.find("guid")
+    if g and g.text.strip().startswith("http"):
+        return g.text.strip()
+    return ""
+
+def _host(url: str) -> str:
+    try:
+        return urlparse(url).hostname or ""
+    except Exception:
+        return ""
+
+BLOCK_ARTICLE_DOMAINS = {"hani.co.kr", "hanion.co.kr"}
+
+async def fetch_text(session: aiohttp.ClientSession, url: str, is_rss: bool = False) -> str:
+    if not url:
+        return ""
+    for attempt in range(3):
+        try:
+            async with async_timeout.timeout(REQUEST_TIMEOUT):
+                async with session.get(url, headers=UA, allow_redirects=True) as resp:
+                    if resp.status != 200:
+                        tag = "RSS" if is_rss else "FETCH"
+                        print(f"[{tag} FAIL] {resp.status} {url}")
+                        return ""
+                    return await resp.text()
+        except Exception as e:
+            if attempt < 2:
+                await asyncio.sleep(0.7 * (attempt + 1))
+                continue
+            tag = "RSS" if is_rss else "FETCH"
+            print(f"[{tag} ERROR] {url} {repr(e)}")
+            return ""
+    return ""
 
 async def search_news(session: aiohttp.ClientSession):
     items = []
@@ -407,7 +344,7 @@ async def search_news(session: aiohttp.ClientSession):
     return [it for _, it in norm]
 
 # -------------------------
-# dedupe (48h)
+# dedupe
 # -------------------------
 seen_fp_expiry = {}
 
@@ -430,6 +367,10 @@ async def run_once():
     now = datetime.now(KST)
     _purge_seen(now)
 
+    scanned = 0
+    ews_passed = 0
+    sig_hits = 0
+
     async with aiohttp.ClientSession() as session:
         rss_items = await search_news(session)
 
@@ -449,41 +390,40 @@ async def run_once():
             if (now - pub).total_seconds() > 72 * 3600:
                 continue
 
-            # 본문/요약 확보
             article_text = ""
             if link and _host(link) not in BLOCK_ARTICLE_DOMAINS:
-                html = await fetch_text(session, link)
+                html = await fetch_text(session, link, is_rss=False)
                 article_text = html_to_text(html) if html else ""
 
             if len(article_text) < 200:
-                article_text = html_to_text(rss_snippet(item))
+                article_text = html_to_text(rss_snippet(item)) or title
 
             if not article_text:
-                article_text = title
+                continue
 
+            scanned += 1
             blob = f"{title}\n{article_text}"
 
             # ---- EWS ----
             if is_ews_event(title, article_text):
+                ews_passed += 1
                 keys = extract_country_keys(title, article_text, top_k=2)
                 keys = [k for k in keys if k != "미상"]
-
                 ews_events.append({
                     "pub": pub.isoformat(),
                     "title": title,
                     "link": link,
                     "countries": keys or ["미상"],
-                    "summary": ""  # 요약/번역은 서버 다른 단계에서 붙이기
+                    "summary": ""
                 })
-
                 seen_fp_expiry[fp] = now + timedelta(hours=DEDUP_HOURS)
-                if len(ews_events) >= 40:
-                    continue
                 continue
 
             # ---- RISK ----
             signals = extract_signals(blob)
-            if not signals:
+            if signals:
+                sig_hits += 1
+            else:
                 continue
 
             strong = (sum(signals.values()) >= 3) or (signals.get("military", 0) >= 3)
@@ -506,7 +446,6 @@ async def run_once():
                     repeat_b = max(repeated_bonus(a, now), repeated_bonus(b, now))
                     score = compute_risk_score(signals, hours_ago, repeat_b + 0.5)
                     band = band_from_score(score)
-
                     risk_events.append({
                         "pub": pub.isoformat(),
                         "title": title,
@@ -529,15 +468,13 @@ async def run_once():
                     "signals": json.dumps(signals, ensure_ascii=False)
                 })
 
-            if ews_events or risk_events:
-                seen_fp_expiry[fp] = now + timedelta(hours=DEDUP_HOURS)
+            seen_fp_expiry[fp] = now + timedelta(hours=DEDUP_HOURS)
 
-            if len(risk_events) >= 80:
-                continue
+    # ✅ 여기 로그는 파일이 정말 이 버전일 때만 뜹니다
+    print(f"[DEBUG] scanned={scanned} ews_pass={ews_passed} sig_hits={sig_hits} "
+          f"ews_events={len(ews_events)} risk_events={len(risk_events)}")
 
     return ews_events, risk_events
-
-
 
 
 

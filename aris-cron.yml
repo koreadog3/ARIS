@@ -1,0 +1,14 @@
+name: ARIS Auto Poll
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # 10분마다 (UTC 기준)
+  workflow_dispatch:
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /run to fetch new data
+        run: |
+          curl -X POST https://https://inherent-tapir-logo-studio-db448073.koyeb.app/run

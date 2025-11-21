@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"/>
+  <title>EWS/RISK Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      margin: 20px;
+      background: #0f1115;
+      color: #e6e6e6;
+    }
+    h1 { margin-bottom: 8px; }
+    .sub { color:#aaa; margin-bottom:16px; }
+    .row { display:flex; gap:16px; flex-wrap:wrap; }
+    .panel {
+      flex:1;
+      min-width: 320px;
+      background:#151823;
+      border:1px solid #22283a;
+      padding:12px 14px;
+      border-radius:12px;
+      box-shadow: 0 6px 14px rgba(0,0,0,.25);
+    }
+    .panel h2 { margin: 6px 0 10px; }
+    .card {
+      border-top:1px solid #22283a;
+      padding:10px 0;
+      display:flex;
+      flex-direction:column;
+      gap:4px;
+    }
+    .title { font-weight:700; font-size:15px; line-height:1.35; }
+    .meta { color:#aeb4c7; font-size:12px; }
+    .line { font-size:13px; }
+    .tag {
+      display:inline-block; padding:2px 6px; border-radius:999px;
+      font-size:12px; margin-right:6px; background:#232841;
+    }
+    .band-high { color:#ff5a5a; font-weight:800; }
+    .band-mid  { color:#ffb347; font-weight:800; }
+    .band-low  { color:#9ecbff; font-weight:700; }
+    a { color:#7db2ff; text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    .toolbar {
+      display:flex; gap:8px; align-items:center; margin-bottom:8px;
+    }
+    .toolbar input {
+      flex:1; padding:8px 10px; border-radius:8px; border:1px solid #2a3150;
+      background:#0f111a; color:#e6e6e6;
+    }
+    .toolbar button {
+      padding:8px 10px; border-radius:8px; border:1px solid #2a3150;
+      background:#1a2040; color:#e6e6e6; cursor:pointer;
+    }
+  </style>
+</head>
+<body>
+  <h1>EWS / RISK 실시간 대시보드</h1>
+  <div class="sub">서버: 127.0.0.1:8000 · 15초 자동 갱신</div>
+
+  <div class="toolbar">
+    <input id="q" placeholder="검색(국가/헤드라인)..." />
+    <button onclick="load()">새로고침</button>
+  </div>
+
+  <div class="row">
+    <div class="panel">
+      <h2>EWS</h2>
+      <div id="ews"></div>
+    </div>
+
+    <div class="panel">
+      <h2>RISK</h2>
+      <div id="risk"></div>
+    </div>
+  </div>
+
+<script>
+const API = "http://127.0.0.1:8000";
+
+function bandClass(band) {
+  if (band === "고위험") return "band-high";
+  if (band === "경계") return "band-mid";
+  return "band-low";
+}
+
+function matchQ(obj, q) {
+  if (!q) return true;
+  q = q.toLowerCase();
+  const hay = [
+    obj.title || "",
+    obj.key || "",
+    obj.countries || "",
+    obj.summary || ""
+  ].join(" ").toLowerCase();
+  return hay.includes(q);
+}
+
+async function load() {
+  const q = document.getElementById("q").value.trim();
+
+  const ews = await (await fetch(`${API}/ews`)).json();
+  const risk = await (await fetch(`${API}/risk`)).json();
+
+  const ewsFiltered = ews.filter(e => matchQ(e, q));
+  const riskFiltered = risk.filter(r => matchQ(r, q));
+
+  document.getElementById("ews").innerHTML =
+    (ewsFiltered.length ? ewsFiltered : []).map(e => `
+      <div class="card">
+        <div class="title">${e.title}</div>
+        <div class="meta">${e.pub} · ${e.countries}</div>
+        ${e.summary ? `<div class="line">${e.summary}</div>` : ""}
+        <div class="line"><a href="${e.link}" target="_blank">기사 보기</a></div>
+      </div>
+    `).join("") || "<div class='meta'>표시할 EWS 이벤트가 없습니다.</div>";
+
+  document.getElementById("risk").innerHTML =
+    (riskFiltered.length ? riskFiltered : []).map(r => `
+      <div class="card">
+        <div class="title">${r.title}</div>
+        <div class="meta">${r.pub} · ${r.key}</div>
+        <div class="${bandClass(r.band)}">점수 ${r.score}/10 · ${r.band}</div>
+        <div class="line"><a href="${r.link}" target="_blank">기사 보기</a></div>
+      </div>
+    `).join("") || "<div class='meta'>표시할 RISK 이벤트가 없습니다.</div>";
+}
+
+load();
+setInterval(load, 15000);
+</script>
+</body>
+</html>

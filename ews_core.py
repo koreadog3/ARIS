@@ -1,4 +1,4 @@
-# ews_core.py (quiet + stable)
+# ews_core.py (stable + diversified + quiet fetch + gtrans brief)
 import re
 import json
 import os
@@ -12,11 +12,25 @@ from collections import defaultdict, deque
 from math import exp
 from openai import AsyncOpenAI
 
+# 비공식 Google 번역 (영문 기사 짧은 번역용)
+try:
+    from googletrans import Translator as GTranslator
+except Exception:
+    GTranslator = None
+
 # -------------------------
 # 기본 설정
 # -------------------------
 REQUEST_TIMEOUT = 15
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+DEDUP_HOURS = 48
+
+UA = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
 
 KST = timezone(timedelta(hours=9))
 
@@ -71,6 +85,7 @@ EWS_KOREA_CTX = re.compile(
     r")"
 )
 
+# "대한민국 대사관 철수(=해외 공관 철수)" 제외
 EWS_KOREA_NEG = re.compile(
     r"(?i)("
     r"Korean\s+embassy|ROK\s+embassy|Republic\s+of\s+Korea\s+embassy|"
@@ -79,7 +94,6 @@ EWS_KOREA_NEG = re.compile(
 )
 
 def quick_filter(text: str) -> bool:
-    """주한 외국공관 철수/대피/폐쇄에 해당하는 경우만 True."""
     if not text:
         return False
     if not EWS_ACTION.search(text):
@@ -132,12 +146,27 @@ SIGNAL_DEFS = {
     },
 }
 
+# -------------------------
+# ✅ 오탐 줄이기용 부정 필터 (KO/EN 확장판)
+# -------------------------
 NEG_RISK_FILTER = re.compile(
     r"(?i)("
+    # EN entertainment / culture
     r"Netflix|film|movie|series|documentary|biopic|drama|trailer|episode|season|box\s*office|"
-    r"celebrity|entertainment|interview|review|feature|opinion|"
+    r"celebrity|entertainment|interview|review|feature|opinion|arts?|culture|music|festival|theater|"
+    # EN sports
     r"sports?|match|tournament|league|"
-    r"crime|killer|murder|manhunt|cold\s*case|serial\s*killer|police\s*case|detective"
+    # EN crime / drugs
+    r"crime|killer|murder|manhunt|cold\s*case|serial\s*killer|police\s*case|detective|"
+    r"drug(s)?|narcotic(s)?|cocaine|heroin|fentanyl|cartel|smuggl(ing|er)|seizure|bust|arrest|raid|"
+    # KO entertainment / culture
+    r"|영화|드라마|시리즈|다큐|예고편|시즌|오마주|리뷰|평론|"
+    r"문화|연예|연예계|배우|가수|공연|개봉|흥행|박스오피스|"
+    # KO sports
+    r"스포츠|경기|리그|토너먼트|"
+    # KO crime / drugs
+    r"범죄|살인|피살|강도|"
+    r"마약|코카인|밀매|카르텔|압수|단속|체포|구속"
     r")"
 )
 
@@ -319,29 +348,24 @@ def _domain_of(link: str) -> str:
 
 # 본문 fetch 시도 자체를 막고 RSS 스니펫만 쓰는 도메인
 BLOCK_ARTICLE_DOMAINS = {
-    "france24.com",
-    "www.france24.com",
-    "hani.co.kr",          # 한겨레는 본문 403/유료벽 케이스 많음 → 스니펫 위주
-    "www.hani.co.kr",
+    "france24.com", "www.france24.com",
+    "hani.co.kr", "www.hani.co.kr",
 }
 
 async def fetch_text(session: aiohttp.ClientSession, url: str, is_rss: bool = False) -> str:
     if not url:
         return ""
 
-    # 간단 재시도(조용히)
     for attempt in range(3):
         try:
             async with async_timeout.timeout(REQUEST_TIMEOUT):
                 async with session.get(url, headers=UA, allow_redirects=True, ssl=False) as resp:
                     status = resp.status
 
-                    # 기사 본문에서 흔한 차단/노이즈는 로그 없이 폴백
                     if (not is_rss) and (status in QUIET_ARTICLE_STATUSES):
                         return ""
 
                     if status >= 400:
-                        # RSS 쪽만 최소 로그
                         if is_rss:
                             print(f"[RSS FAIL] {status} {url}")
                         return ""
@@ -361,7 +385,6 @@ async def fetch_text(session: aiohttp.ClientSession, url: str, is_rss: bool = Fa
 
 def rss_snippet(item) -> str:
     candidates: list[str] = []
-
     for tag in ("content:encoded", "content", "description", "summary", "dc:description"):
         node = item.find(tag)
         if node and node.text:
@@ -428,7 +451,7 @@ def pick_best_link(item) -> str:
 # -------------------------
 async def search_news(session: aiohttp.ClientSession):
     items = []
-    PER_FEED_CAP = 30
+    PER_FEED_CAP = 30  # 피드 하나당 상한
 
     for url in NEWS_FEEDS:
         xml = await fetch_text(session, url, is_rss=True)
@@ -437,7 +460,6 @@ async def search_news(session: aiohttp.ClientSession):
         try:
             soup = BeautifulSoup(xml, "xml")
         except Exception:
-            # RSS 파싱 실패도 조용히 넘김
             continue
 
         feed_items = (soup.find_all("item") or []) + (soup.find_all("entry") or [])
@@ -455,9 +477,8 @@ async def search_news(session: aiohttp.ClientSession):
     return [it for _, it in norm]
 
 # -------------------------
-# dedupe (48h)
+# dedupe (런타임 48h)
 # -------------------------
-DEDUP_HOURS = 48
 seen_fp_expiry: dict[str, datetime] = {}
 
 def _fingerprint(title: str, link: str) -> str:
@@ -470,11 +491,10 @@ def _purge_seen(now: datetime):
             seen_fp_expiry.pop(fp, None)
 
 # -------------------------
-# AI 요약/번역 (EWS 전용) - GPT-5 Nano 고정
+# AI 요약/번역 (EWS 전용) - GPT-5 Nano
 # -------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = "gpt-5-nano"
-
 _ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 def looks_english(s: str) -> bool:
@@ -487,10 +507,8 @@ def looks_english(s: str) -> bool:
 async def summarize_translate_ews(title: str, body: str) -> str:
     if not _ai_client:
         return ""
-
     try:
         text = (body or "")[:4000]
-
         prompt = f"""
 다음은 '주한 외국공관 철수/대피/폐쇄/여행경보 상향'과 관련될 수 있는 기사입니다.
 
@@ -522,7 +540,31 @@ async def summarize_translate_ews(title: str, body: str) -> str:
                         out_text += c.text
 
         return out_text.strip()
+    except Exception:
+        return ""
 
+# -------------------------
+# ✅ Google 비공식 번역 (외국 뉴스 짧은 번역)
+# -------------------------
+async def gtranslate_brief_ko(title: str, body: str) -> str:
+    """
+    영문 기사일 때 제목+본문 초반만 짧게 한국어로 번역.
+    실패 시 조용히 빈 문자열 반환.
+    """
+    if not GTranslator:
+        return ""
+    try:
+        snippet = (f"{title}\n{body}" or "").strip()
+        if not snippet:
+            return ""
+        snippet = snippet[:1200]  # 너무 길면 느려지므로 제한
+
+        async with GTranslator(service_urls=[
+            "translate.google.com",
+            "translate.google.co.kr",
+        ]) as tr:
+            res = await tr.translate(snippet, dest="ko")
+            return (res.text or "").strip()
     except Exception:
         return ""
 
@@ -589,7 +631,7 @@ async def run_once():
                 article_text = ""
                 dom = _domain_of(link)
 
-                # 차단 도메인은 본문 fetch 자체를 하지 않음(RSS 스니펫만 사용)
+                # 차단 도메인은 본문 fetch를 안 하고 스니펫만 사용
                 if link and dom not in BLOCK_ARTICLE_DOMAINS:
                     article_html = await fetch_text(session, link, is_rss=False)
                     if article_html:
@@ -611,14 +653,21 @@ async def run_once():
 
                     summary = ""
                     if looks_english(blob):
+                        # EWS는 OpenAI 요약 우선
                         summary = await summarize_translate_ews(title, article_text)
+
+                    # OpenAI 키가 없거나 실패해도 gtrans 짧은 번역은 붙임
+                    gtrans = ""
+                    if looks_english(blob):
+                        gtrans = await gtranslate_brief_ko(title, article_text)
 
                     ews_events.append({
                         "pub": pub.isoformat(),
                         "title": title,
                         "link": link,
                         "countries": keys or ["미상"],
-                        "summary": summary
+                        "summary": summary,
+                        "gtrans": gtrans
                     })
 
                     seen_fp_expiry[fp] = now + timedelta(hours=DEDUP_HOURS)
@@ -629,16 +678,24 @@ async def run_once():
                 if not signals:
                     continue
 
-                strong = (sum(signals.values()) >= 3) or (signals.get("military", 0) >= 3)
-                if NEG_RISK_FILTER.search(title) and not strong:
-                    continue
-
                 total_sig = sum(signals.values())
                 multi_bucket = sum(1 for v in signals.values() if v > 0) >= 2
+                strong = (total_sig >= 3) or (signals.get("military", 0) >= 3)
+
+                # ✅ 부정필터 히트 시, 단일버킷 strong 정도는 버린다
+                neg_hit = NEG_RISK_FILTER.search(title) or NEG_RISK_FILTER.search(article_text)
+                if neg_hit and not (multi_bucket or total_sig >= 4):
+                    continue
+
                 if not (strong or multi_bucket or total_sig >= 2):
                     continue
 
                 hours_ago = max(0.0, (now - pub).total_seconds() / 3600.0)
+
+                # 외국(영문) risk 기사면 gtrans 짧은 번역 추가
+                gtrans = ""
+                if looks_english(blob):
+                    gtrans = await gtranslate_brief_ko(title, article_text)
 
                 pairs = extract_country_pairs(title, article_text)
                 if pairs:
@@ -657,7 +714,8 @@ async def run_once():
                             "key": key,
                             "score": float(score),
                             "band": band,
-                            "signals": json.dumps(signals, ensure_ascii=False)
+                            "signals": json.dumps(signals, ensure_ascii=False),
+                            "gtrans": gtrans
                         })
                 else:
                     score = compute_risk_score(signals, hours_ago, 0.0)
@@ -669,16 +727,17 @@ async def run_once():
                         "key": "미상",
                         "score": float(score),
                         "band": band,
-                        "signals": json.dumps(signals, ensure_ascii=False)
+                        "signals": json.dumps(signals, ensure_ascii=False),
+                        "gtrans": gtrans
                     })
 
-                if ews_events or risk_events:
-                    seen_fp_expiry[fp] = now + timedelta(hours=DEDUP_HOURS)
+                seen_fp_expiry[fp] = now + timedelta(hours=DEDUP_HOURS)
 
             except Exception:
                 continue
 
     return ews_events, risk_events
+
 
 
 

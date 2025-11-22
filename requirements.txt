@@ -6,3 +6,4 @@ beautifulsoup4
 lxml
 python-dotenv
 openai
+googletrans>=4.0.0

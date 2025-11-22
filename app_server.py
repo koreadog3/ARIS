@@ -1,15 +1,18 @@
 # app_server.py
+import os
 import asyncio
-import sqlite3
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from storage import init_db, DB_PATH, insert_ews, insert_risk
 from ews_core import run_once
+from storage import init_db, insert_ews, insert_risk, get_ews, get_risk, clear_all
 
-app = FastAPI()
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))  # 기본 2분
+EWS_LIMIT = int(os.getenv("EWS_LIMIT", "100"))
+RISK_LIMIT = int(os.getenv("RISK_LIMIT", "200"))
 
-# CORS: 프론트 호출 허용
+app = FastAPI(title="ARIS / EWS + RISK")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,51 +21,43 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def fetch_all(table: str, limit: int = 200):
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    cur = con.cursor()
-    cur.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT ?", (limit,))
-    rows = [dict(r) for r in cur.fetchall()]
-    con.close()
-    return rows
-
-@app.get("/ews")
-def get_ews():
-    return fetch_all("ews_events")
-
-@app.get("/risk")
-def get_risk():
-    return fetch_all("risk_events")
-
-@app.post("/run")
-async def run_manual():
-    # 수동 1회 수집/분석
-    ews_events, risk_events = await run_once()
-    for e in ews_events:
-        insert_ews(e)
-    for r in risk_events:
-        insert_risk(r)
-    return {"inserted_ews": len(ews_events), "inserted_risk": len(risk_events)}
-
-POLL_SECONDS = 120  # 2분 (원하면 1800=30분으로)
+poll_task = None
 
 async def poll_loop():
     while True:
         try:
             ews_events, risk_events = await run_once()
-            for e in ews_events:
-                insert_ews(e)
-            for r in risk_events:
-                insert_risk(r)
-            print(f"[POLL] inserted ews={len(ews_events)} risk={len(risk_events)}")
+            ews_n = insert_ews(ews_events)
+            risk_n = insert_risk(risk_events)
+            print(f"[POLL] inserted ews={ews_n} risk={risk_n}")
         except Exception as e:
-            print("[POLL ERROR]", repr(e))
-
+            print("[POLL ERROR]", e)
         await asyncio.sleep(POLL_SECONDS)
 
 @app.on_event("startup")
-async def startup():
+async def on_startup():
+    global poll_task
     init_db()
-    asyncio.create_task(poll_loop())
+    poll_task = asyncio.create_task(poll_loop())
     print("[STARTUP] poll_loop task created")
+
+@app.get("/ews")
+def api_ews():
+    return get_ews(EWS_LIMIT)
+
+@app.get("/risk")
+def api_risk():
+    return get_risk(RISK_LIMIT)
+
+@app.post("/run")
+async def api_run_manual():
+    ews_events, risk_events = await run_once()
+    ews_n = insert_ews(ews_events)
+    risk_n = insert_risk(risk_events)
+    return {"inserted_ews": ews_n, "inserted_risk": risk_n}
+
+@app.post("/clear")
+def api_clear():
+    clear_all()
+    return {"ok": True}
+

@@ -9,7 +9,7 @@ from ews_core import run_once
 
 app = FastAPI()
 
-# CORS: 프론트(5173)에서 백엔드(8000) 호출 허용
+# CORS: 프론트 호출 허용
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

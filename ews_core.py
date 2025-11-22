@@ -1,4 +1,4 @@
-# ews_core.py (stable + diversified + quiet fetch + gtrans brief)
+# ews_core.py (stable + diversified + quiet fetch + gtrans brief + title ko)
 import re
 import json
 import os
@@ -545,32 +545,57 @@ async def summarize_translate_ews(title: str, body: str) -> str:
 
 # -------------------------
 # ✅ Google 비공식 번역 (외국 뉴스 짧은 번역)
+#    - 동기/비동기 translate 어떤 구현이 와도 안전하게 처리
 # -------------------------
 async def gtranslate_brief_ko(title: str, body: str) -> str:
     """
     영문 기사일 때 제목+본문 초반만 짧게 한국어로 번역.
+    googletrans 구현이 동기/비동기 어느 쪽이든 안전하게 처리.
     실패 시 조용히 빈 문자열 반환.
     """
     if not GTranslator:
         return ""
+
     snippet = (f"{title}\n{body}" or "").strip()
     if not snippet:
         return ""
-    snippet = snippet[:1200]  # 너무 길면 느려지므로 제한
+    snippet = snippet[:1200]
+
+    def _make_translator():
+        try:
+            return GTranslator(service_urls=[
+                "translate.google.com",
+                "translate.google.co.kr",
+            ])
+        except TypeError:
+            # 어떤 버전은 service_urls 인자를 안 받음
+            return GTranslator()
 
     try:
-        tr = GTranslator(service_urls=[
-            "translate.google.com",
-            "translate.google.co.kr",
-        ])
+        tr = _make_translator()
+        res = tr.translate(snippet, dest="ko")
 
-        def _do_translate():
-            return tr.translate(snippet, dest="ko").text
+        # translate가 코루틴이면 await
+        if asyncio.iscoroutine(res):
+            res = await res
 
-        res_text = await asyncio.to_thread(_do_translate)
-        return (res_text or "").strip()
+        text = getattr(res, "text", "") or ""
+        return text.strip()
+
     except Exception:
-        return ""
+        # 동기 translate가 블로킹/불안정할 때 스레드 fallback
+        try:
+            def _sync_translate():
+                tr2 = _make_translator()
+                r = tr2.translate(snippet, dest="ko")
+                if asyncio.iscoroutine(r):
+                    return ""
+                return getattr(r, "text", "") or ""
+
+            text = await asyncio.to_thread(_sync_translate)
+            return (text or "").strip()
+        except Exception:
+            return ""
 
 # -------------------------
 # 도메인 다양성 강제 선택
@@ -635,7 +660,7 @@ async def run_once():
                 article_text = ""
                 dom = _domain_of(link)
 
-                # 차단 도메인은 본문 fetch를 안 하고 스니펫만 사용
+                # 차단 도메인은 본문 fetch를 안 하고 RSS 스니펫만 사용
                 if link and dom not in BLOCK_ARTICLE_DOMAINS:
                     article_html = await fetch_text(session, link, is_rss=False)
                     if article_html:
@@ -652,22 +677,32 @@ async def run_once():
 
                 # ---- EWS ----
                 if quick_filter(blob):
-                    keys = extract_country_keys(title, article_text, top_k=2)
+                    title_en = title
+                    title_ko = ""
+                    if looks_english(blob):
+                        # 제목만 먼저 짧게 번역해서 표시용으로 사용
+                        title_ko = await gtranslate_brief_ko(title_en, "")
+                    display_title = title_ko or title_en
+
+                    # 나라 추출은 원문 제목 기준이 더 정확함
+                    keys = extract_country_keys(title_en, article_text, top_k=2)
                     keys = [k for k in keys if k != "미상"]
 
                     summary = ""
                     if looks_english(blob):
                         # EWS는 OpenAI 요약 우선
-                        summary = await summarize_translate_ews(title, article_text)
+                        summary = await summarize_translate_ews(title_en, article_text)
 
                     # OpenAI 키가 없거나 실패해도 gtrans 짧은 번역은 붙임
                     gtrans = ""
                     if looks_english(blob):
-                        gtrans = await gtranslate_brief_ko(title, article_text)
+                        gtrans = await gtranslate_brief_ko(title_en, article_text)
 
                     ews_events.append({
                         "pub": pub.isoformat(),
-                        "title": title,
+                        "title": display_title,  # ✅ 프론트에 바로 보일 제목(한국어)
+                        "title_en": title_en,
+                        "title_ko": title_ko,
                         "link": link,
                         "countries": keys or ["미상"],
                         "summary": summary,
@@ -696,12 +731,16 @@ async def run_once():
 
                 hours_ago = max(0.0, (now - pub).total_seconds() / 3600.0)
 
-                # 외국(영문) risk 기사면 gtrans 짧은 번역 추가
+                # ✅ 영문이면 title을 한국어로 치환 저장 + gtrans 생성
+                title_en = title
+                title_ko = ""
                 gtrans = ""
                 if looks_english(blob):
-                    gtrans = await gtranslate_brief_ko(title, article_text)
+                    title_ko = await gtranslate_brief_ko(title_en, "")
+                    gtrans = await gtranslate_brief_ko(title_en, article_text)
+                display_title = title_ko or title_en
 
-                pairs = extract_country_pairs(title, article_text)
+                pairs = extract_country_pairs(title_en, article_text)
                 if pairs:
                     for a, b in pairs:
                         key = f"{a} | {b}"
@@ -713,7 +752,9 @@ async def run_once():
 
                         risk_events.append({
                             "pub": pub.isoformat(),
-                            "title": title,
+                            "title": display_title,  # ✅ 프론트 표시용(한국어)
+                            "title_en": title_en,
+                            "title_ko": title_ko,
                             "link": link,
                             "key": key,
                             "score": float(score),
@@ -726,7 +767,9 @@ async def run_once():
                     band = band_from_score(score)
                     risk_events.append({
                         "pub": pub.isoformat(),
-                        "title": title,
+                        "title": display_title,  # ✅ 프론트 표시용(한국어)
+                        "title_en": title_en,
+                        "title_ko": title_ko,
                         "link": link,
                         "key": "미상",
                         "score": float(score),
@@ -741,7 +784,6 @@ async def run_once():
                 continue
 
     return ews_events, risk_events
-
 
 
 

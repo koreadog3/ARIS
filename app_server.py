@@ -1,71 +1,141 @@
-# app_server.py
+# app_server.py (ARIS backend)
 import os
 import asyncio
-from fastapi import FastAPI
+import sqlite3
+from typing import List, Dict, Any, Optional
+
+from fastapi import FastAPI, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from ews_core import run_once
-from storage import init_db, insert_ews, insert_risk, get_ews, get_risk, clear_all
+from storage import init_db, DB_PATH, insert_ews, insert_risk
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))  # 기본 2분
-EWS_LIMIT = int(os.getenv("EWS_LIMIT", "100"))
-RISK_LIMIT = int(os.getenv("RISK_LIMIT", "200"))
+# storage.py에 clear_all이 있으면 그걸 쓰고,
+# 없으면 여기서 안전하게 fallback
+try:
+    from storage import clear_all  # type: ignore
+except Exception:
+    def clear_all():
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute("DELETE FROM ews_events")
+        cur.execute("DELETE FROM risk_events")
+        con.commit()
+        con.close()
 
-app = FastAPI(title="ARIS / EWS + RISK")
+
+app = FastAPI(title="ARIS Backend", version="0.3.0")
+
+# -------------------------
+# CORS
+# -------------------------
+# 기본은 전체 허용, 필요하면 ENV로 제한 가능
+# 예: CORS_ORIGINS=https://aris.pe.kr,https://arisf.pages.dev
+raw_origins = os.getenv("CORS_ORIGINS", "*")
+if raw_origins.strip() == "*":
+    allow_origins = ["*"]
+else:
+    allow_origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-poll_task = None
+# -------------------------
+# DB fetch helper
+# -------------------------
+def fetch_all(table: str, limit: int = 200) -> List[Dict[str, Any]]:
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT ?", (limit,))
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+    return rows
 
-async def poll_loop():
-    while True:
-        try:
-            ews_events, risk_events = await run_once()
-            ews_n = insert_ews(ews_events)
-            risk_n = insert_risk(risk_events)
-            print(f"[POLL] inserted ews={ews_n} risk={risk_n}")
-        except Exception as e:
-            print("[POLL ERROR]", e)
-        await asyncio.sleep(POLL_SECONDS)
+# 수동 run과 poll이 겹치는 것을 막기 위한 Lock
+_run_lock = asyncio.Lock()
 
-@app.on_event("startup")
-async def on_startup():
-    global poll_task
-    init_db()
-    poll_task = asyncio.create_task(poll_loop())
-    print("[STARTUP] poll_loop task created")
+# -------------------------
+# Routes
+# -------------------------
+@app.get("/")
+def root():
+    return {"ok": True, "service": "ARIS"}
+
+@app.head("/")
+def head_root():
+    return Response(status_code=200)
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.head("/health")
+def head_health():
+    return Response(status_code=200)
 
 @app.get("/ews")
-def api_ews():
-    return get_ews(EWS_LIMIT)
+def get_ews(limit: int = 200):
+    # limit 과도하게 커지는 것 방지
+    limit = max(1, min(1000, int(limit)))
+    return fetch_all("ews_events", limit=limit)
 
 @app.get("/risk")
-def api_risk():
-    return get_risk(RISK_LIMIT)
+def get_risk(limit: int = 200):
+    limit = max(1, min(1000, int(limit)))
+    return fetch_all("risk_events", limit=limit)
 
 @app.post("/run")
-async def api_run_manual():
-    ews_events, risk_events = await run_once()
-    ews_n = insert_ews(ews_events)
-    risk_n = insert_risk(risk_events)
-    return {"inserted_ews": ews_n, "inserted_risk": risk_n}
+async def run_manual():
+    # 수동 1회 수집/분석
+    async with _run_lock:
+        try:
+            ews_events, risk_events = await run_once()
+            for e in ews_events:
+                insert_ews(e)
+            for r in risk_events:
+                insert_risk(r)
+
+            return {
+                "inserted_ews": len(ews_events),
+                "inserted_risk": len(risk_events),
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/clear")
 def api_clear():
     clear_all()
     return {"ok": True}
 
-@app.get("/")
-def root():
-    return {"ok": True, "service": "ARIS"}
+# -------------------------
+# Poll loop
+# -------------------------
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+async def poll_loop():
+    while True:
+        try:
+            async with _run_lock:
+                ews_events, risk_events = await run_once()
+                for e in ews_events:
+                    insert_ews(e)
+                for r in risk_events:
+                    insert_risk(r)
+                print(f"[POLL] inserted ews={len(ews_events)} risk={len(risk_events)}")
+        except Exception as e:
+            print("[POLL ERROR]", repr(e))
+
+        await asyncio.sleep(POLL_SECONDS)
+
+@app.on_event("startup")
+async def startup():
+    init_db()
+    asyncio.create_task(poll_loop())
+    print("[STARTUP] poll_loop task created")
 

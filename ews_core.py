@@ -553,18 +553,22 @@ async def gtranslate_brief_ko(title: str, body: str) -> str:
     """
     if not GTranslator:
         return ""
-    try:
-        snippet = (f"{title}\n{body}" or "").strip()
-        if not snippet:
-            return ""
-        snippet = snippet[:1200]  # 너무 길면 느려지므로 제한
+    snippet = (f"{title}\n{body}" or "").strip()
+    if not snippet:
+        return ""
+    snippet = snippet[:1200]  # 너무 길면 느려지므로 제한
 
-        async with GTranslator(service_urls=[
+    try:
+        tr = GTranslator(service_urls=[
             "translate.google.com",
             "translate.google.co.kr",
-        ]) as tr:
-            res = await tr.translate(snippet, dest="ko")
-            return (res.text or "").strip()
+        ])
+
+        def _do_translate():
+            return tr.translate(snippet, dest="ko").text
+
+        res_text = await asyncio.to_thread(_do_translate)
+        return (res_text or "").strip()
     except Exception:
         return ""
 

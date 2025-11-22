@@ -1,112 +1,146 @@
-# storage.py (gtrans 컬럼 포함 + 자동 마이그레이션)
+# storage.py
 import sqlite3
-import json
 from pathlib import Path
+from datetime import datetime, timezone, timedelta
+import json
 
 DB_PATH = Path("ews.db")
-
-def _ensure_column(cur, table: str, col: str, col_type: str = "TEXT"):
-    cur.execute(f"PRAGMA table_info({table})")
-    cols = [r[1] for r in cur.fetchall()]
-    if col not in cols:
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+KST = timezone(timedelta(hours=9))
 
 def init_db():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
 
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS ews_events(
+    CREATE TABLE IF NOT EXISTS ews_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         pub TEXT,
         title TEXT,
-        link TEXT,
+        link TEXT UNIQUE,
         countries TEXT,
         summary TEXT,
-        gtrans TEXT
+        created_at TEXT
     )
     """)
 
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS risk_events(
+    CREATE TABLE IF NOT EXISTS risk_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         pub TEXT,
         title TEXT,
-        link TEXT,
+        link TEXT UNIQUE,
         key TEXT,
         score REAL,
         band TEXT,
         signals TEXT,
-        gtrans TEXT
+        created_at TEXT
     )
     """)
 
-    # 기존 DB 마이그레이션(컬럼 없으면 자동 추가)
-    _ensure_column(cur, "ews_events", "gtrans", "TEXT")
-    _ensure_column(cur, "risk_events", "gtrans", "TEXT")
-
-    # 링크 인덱스(중복 체크/조회 속도 개선)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_ews_link ON ews_events(link)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_risk_link ON risk_events(link)")
-
     con.commit()
     con.close()
 
-def _exists(cur, table: str, link: str) -> bool:
-    if not link:
-        return False
-    cur.execute(f"SELECT 1 FROM {table} WHERE link=? LIMIT 1", (link,))
-    return cur.fetchone() is not None
+def _now_iso():
+    return datetime.now(KST).isoformat()
 
-def insert_ews(e: dict):
+def insert_ews(events):
+    if not events:
+        return 0
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
+    inserted = 0
 
-    link = e.get("link", "")
-    if _exists(cur, "ews_events", link):
-        con.close()
-        return False
+    for e in events:
+        try:
+            countries = e.get("countries", ["미상"])
+            if isinstance(countries, (list, dict)):
+                countries = json.dumps(countries, ensure_ascii=False)
 
-    countries_list = e.get("countries", []) or []
-    countries_json = json.dumps(countries_list, ensure_ascii=False)
+            cur.execute("""
+            INSERT OR IGNORE INTO ews_events
+            (pub, title, link, countries, summary, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                e.get("pub"),
+                e.get("title"),
+                e.get("link"),
+                countries,
+                e.get("summary", ""),
+                _now_iso()
+            ))
+            if cur.rowcount > 0:
+                inserted += 1
+        except Exception:
+            continue
 
-    cur.execute(
-        "INSERT INTO ews_events(pub,title,link,countries,summary,gtrans) VALUES(?,?,?,?,?,?)",
-        (
-            e.get("pub",""),
-            e.get("title",""),
-            link,
-            countries_json,
-            e.get("summary",""),
-            e.get("gtrans",""),
-        )
-    )
     con.commit()
     con.close()
-    return True
+    return inserted
 
-def insert_risk(r: dict):
+def insert_risk(events):
+    if not events:
+        return 0
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
+    inserted = 0
 
-    link = r.get("link", "")
-    if _exists(cur, "risk_events", link):
-        con.close()
-        return False
+    for e in events:
+        try:
+            cur.execute("""
+            INSERT OR IGNORE INTO risk_events
+            (pub, title, link, key, score, band, signals, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                e.get("pub"),
+                e.get("title"),
+                e.get("link"),
+                e.get("key", "미상"),
+                float(e.get("score", 0.0)),
+                e.get("band", "낮음"),
+                e.get("signals", "{}"),
+                _now_iso()
+            ))
+            if cur.rowcount > 0:
+                inserted += 1
+        except Exception:
+            continue
 
-    cur.execute(
-        "INSERT INTO risk_events(pub,title,link,key,score,band,signals,gtrans) VALUES(?,?,?,?,?,?,?,?)",
-        (
-            r.get("pub",""),
-            r.get("title",""),
-            link,
-            r.get("key","미상"),
-            float(r.get("score",0.0)),
-            r.get("band","낮음"),
-            r.get("signals","{}"),
-            r.get("gtrans",""),
-        )
-    )
     con.commit()
     con.close()
-    return True
+    return inserted
+
+def get_ews(limit=100):
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute("""
+    SELECT pub, title, link, countries, summary
+    FROM ews_events
+    ORDER BY pub DESC
+    LIMIT ?
+    """, (limit,))
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+    return rows
+
+def get_risk(limit=200):
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute("""
+    SELECT pub, title, link, key, score, band, signals
+    FROM risk_events
+    ORDER BY pub DESC
+    LIMIT ?
+    """, (limit,))
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+    return rows
+
+def clear_all():
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM ews_events")
+    cur.execute("DELETE FROM risk_events")
+    con.commit()
+    con.close()

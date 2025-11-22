@@ -61,3 +61,11 @@ def api_clear():
     clear_all()
     return {"ok": True}
 
+@app.get("/")
+def root():
+    return {"ok": True, "service": "ARIS"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+

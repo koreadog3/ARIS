@@ -1,8 +1,9 @@
-# ews_core.py (stable + diversified + quiet fetch + gtrans brief + title ko)
+# ews_core.py (stable + diversified + quiet fetch + EWS-only GPT summary/translation)
 import re
 import json
 import os
 import asyncio
+import inspect
 import aiohttp
 import async_timeout
 from bs4 import BeautifulSoup
@@ -12,7 +13,7 @@ from collections import defaultdict, deque
 from math import exp
 from openai import AsyncOpenAI
 
-# 비공식 Google 번역 (영문 기사 짧은 번역용)
+# 비공식 Google 번역 (EWS GPT 실패 대비용)
 try:
     from googletrans import Translator as GTranslator
 except Exception:
@@ -146,25 +147,17 @@ SIGNAL_DEFS = {
     },
 }
 
-# -------------------------
-# ✅ 오탐 줄이기용 부정 필터 (KO/EN 확장판)
-# -------------------------
+# ✅ 오탐 줄이기용 부정 필터
 NEG_RISK_FILTER = re.compile(
     r"(?i)("
-    # EN entertainment / culture
     r"Netflix|film|movie|series|documentary|biopic|drama|trailer|episode|season|box\s*office|"
     r"celebrity|entertainment|interview|review|feature|opinion|arts?|culture|music|festival|theater|"
-    # EN sports
     r"sports?|match|tournament|league|"
-    # EN crime / drugs
     r"crime|killer|murder|manhunt|cold\s*case|serial\s*killer|police\s*case|detective|"
     r"drug(s)?|narcotic(s)?|cocaine|heroin|fentanyl|cartel|smuggl(ing|er)|seizure|bust|arrest|raid|"
-    # KO entertainment / culture
     r"|영화|드라마|시리즈|다큐|예고편|시즌|오마주|리뷰|평론|"
     r"문화|연예|연예계|배우|가수|공연|개봉|흥행|박스오피스|"
-    # KO sports
     r"스포츠|경기|리그|토너먼트|"
-    # KO crime / drugs
     r"범죄|살인|피살|강도|"
     r"마약|코카인|밀매|카르텔|압수|단속|체포|구속"
     r")"
@@ -207,6 +200,7 @@ COUNTRY_CANON = {
     "Czechia":"Czechia","Slovakia":"Slovakia","Hungary":"Hungary","Romania":"Romania","Bulgaria":"Bulgaria",
     "Serbia":"Serbia","Croatia":"Croatia","Slovenia":"Slovenia","Denmark":"Denmark","Portugal":"Portugal",
     "Ireland":"Ireland","New Zealand":"New Zealand",
+
     # KO
     "러시아":"Russia","우크라이나":"Ukraine","폴란드":"Poland","벨라루스":"Belarus",
     "아르메니아":"Armenia","아제르바이잔":"Azerbaijan","인도":"India","파키스탄":"Pakistan",
@@ -346,7 +340,6 @@ def _domain_of(link: str) -> str:
     except Exception:
         return "unknown"
 
-# 본문 fetch 시도 자체를 막고 RSS 스니펫만 쓰는 도메인
 BLOCK_ARTICLE_DOMAINS = {
     "france24.com", "www.france24.com",
     "hani.co.kr", "www.hani.co.kr",
@@ -355,7 +348,6 @@ BLOCK_ARTICLE_DOMAINS = {
 async def fetch_text(session: aiohttp.ClientSession, url: str, is_rss: bool = False) -> str:
     if not url:
         return ""
-
     for attempt in range(3):
         try:
             async with async_timeout.timeout(REQUEST_TIMEOUT):
@@ -380,7 +372,6 @@ async def fetch_text(session: aiohttp.ClientSession, url: str, is_rss: bool = Fa
             if is_rss:
                 print(f"[RSS ERROR] {url}")
             return ""
-
     return ""
 
 def rss_snippet(item) -> str:
@@ -451,7 +442,7 @@ def pick_best_link(item) -> str:
 # -------------------------
 async def search_news(session: aiohttp.ClientSession):
     items = []
-    PER_FEED_CAP = 30  # 피드 하나당 상한
+    PER_FEED_CAP = 30
 
     for url in NEWS_FEEDS:
         xml = await fetch_text(session, url, is_rss=True)
@@ -544,15 +535,10 @@ async def summarize_translate_ews(title: str, body: str) -> str:
         return ""
 
 # -------------------------
-# ✅ Google 비공식 번역 (외국 뉴스 짧은 번역)
-#    - 동기/비동기 translate 어떤 구현이 와도 안전하게 처리
+# Google 비공식 번역 (EWS GPT 실패 대비)
+#  - googletrans 버전에 따라 translate가 sync/async 둘 다 가능
 # -------------------------
 async def gtranslate_brief_ko(title: str, body: str) -> str:
-    """
-    영문 기사일 때 제목+본문 초반만 짧게 한국어로 번역.
-    googletrans 구현이 동기/비동기 어느 쪽이든 안전하게 처리.
-    실패 시 조용히 빈 문자열 반환.
-    """
     if not GTranslator:
         return ""
 
@@ -561,41 +547,31 @@ async def gtranslate_brief_ko(title: str, body: str) -> str:
         return ""
     snippet = snippet[:1200]
 
-    def _make_translator():
-        try:
-            return GTranslator(service_urls=[
-                "translate.google.com",
-                "translate.google.co.kr",
-            ])
-        except TypeError:
-            # 어떤 버전은 service_urls 인자를 안 받음
-            return GTranslator()
-
     try:
-        tr = _make_translator()
-        res = tr.translate(snippet, dest="ko")
+        tr = GTranslator(service_urls=[
+            "translate.google.com",
+            "translate.google.co.kr",
+        ])
 
-        # translate가 코루틴이면 await
-        if asyncio.iscoroutine(res):
-            res = await res
-
-        text = getattr(res, "text", "") or ""
-        return text.strip()
-
-    except Exception:
-        # 동기 translate가 블로킹/불안정할 때 스레드 fallback
-        try:
-            def _sync_translate():
-                tr2 = _make_translator()
-                r = tr2.translate(snippet, dest="ko")
-                if asyncio.iscoroutine(r):
-                    return ""
-                return getattr(r, "text", "") or ""
-
-            text = await asyncio.to_thread(_sync_translate)
-            return (text or "").strip()
-        except Exception:
+        translate_fn = getattr(tr, "translate", None)
+        if not translate_fn:
             return ""
+
+        if inspect.iscoroutinefunction(translate_fn):
+            res = await translate_fn(snippet, dest="ko")
+            return (getattr(res, "text", "") or "").strip()
+
+        def _do_translate():
+            r = translate_fn(snippet, dest="ko")
+            if inspect.isawaitable(r):
+                # 거의 안 나오는 케이스지만 안전하게 처리
+                return asyncio.run(r).text
+            return getattr(r, "text", "")
+
+        res_text = await asyncio.to_thread(_do_translate)
+        return (res_text or "").strip()
+    except Exception:
+        return ""
 
 # -------------------------
 # 도메인 다양성 강제 선택
@@ -623,6 +599,11 @@ def diversify_items(rss_items, cap_total=80, domain_cap=10):
 # 핵심 1회 실행
 # -------------------------
 async def run_once():
+    """
+    1회 RSS 수집/분석 실행.
+    - EWS: GPT-5-nano 요약/번역(실패 시 gtrans 백업)
+    - RISK: 점수/시그널만, 번역/요약 없음
+    """
     ews_events = []
     risk_events = []
 
@@ -660,7 +641,6 @@ async def run_once():
                 article_text = ""
                 dom = _domain_of(link)
 
-                # 차단 도메인은 본문 fetch를 안 하고 RSS 스니펫만 사용
                 if link and dom not in BLOCK_ARTICLE_DOMAINS:
                     article_html = await fetch_text(session, link, is_rss=False)
                     if article_html:
@@ -677,36 +657,24 @@ async def run_once():
 
                 # ---- EWS ----
                 if quick_filter(blob):
-                    title_en = title
-                    title_ko = ""
-                    if looks_english(blob):
-                        # 제목만 먼저 짧게 번역해서 표시용으로 사용
-                        title_ko = await gtranslate_brief_ko(title_en, "")
-                    display_title = title_ko or title_en
-
-                    # 나라 추출은 원문 제목 기준이 더 정확함
-                    keys = extract_country_keys(title_en, article_text, top_k=2)
+                    keys = extract_country_keys(title, article_text, top_k=2)
                     keys = [k for k in keys if k != "미상"]
 
                     summary = ""
-                    if looks_english(blob):
-                        # EWS는 OpenAI 요약 우선
-                        summary = await summarize_translate_ews(title_en, article_text)
-
-                    # OpenAI 키가 없거나 실패해도 gtrans 짧은 번역은 붙임
                     gtrans = ""
+
                     if looks_english(blob):
-                        gtrans = await gtranslate_brief_ko(title_en, article_text)
+                        summary = await summarize_translate_ews(title, article_text)
+                        if not summary:
+                            gtrans = await gtranslate_brief_ko(title, article_text)
 
                     ews_events.append({
                         "pub": pub.isoformat(),
-                        "title": display_title,  # ✅ 프론트에 바로 보일 제목(한국어)
-                        "title_en": title_en,
-                        "title_ko": title_ko,
+                        "title": title,
                         "link": link,
                         "countries": keys or ["미상"],
                         "summary": summary,
-                        "gtrans": gtrans
+                        "gtrans": gtrans,  # DB 저장은 안 해도 payload에 남겨둠
                     })
 
                     seen_fp_expiry[fp] = now + timedelta(hours=DEDUP_HOURS)
@@ -721,7 +689,6 @@ async def run_once():
                 multi_bucket = sum(1 for v in signals.values() if v > 0) >= 2
                 strong = (total_sig >= 3) or (signals.get("military", 0) >= 3)
 
-                # ✅ 부정필터 히트 시, 단일버킷 strong 정도는 버린다
                 neg_hit = NEG_RISK_FILTER.search(title) or NEG_RISK_FILTER.search(article_text)
                 if neg_hit and not (multi_bucket or total_sig >= 4):
                     continue
@@ -731,16 +698,7 @@ async def run_once():
 
                 hours_ago = max(0.0, (now - pub).total_seconds() / 3600.0)
 
-                # ✅ 영문이면 title을 한국어로 치환 저장 + gtrans 생성
-                title_en = title
-                title_ko = ""
-                gtrans = ""
-                if looks_english(blob):
-                    title_ko = await gtranslate_brief_ko(title_en, "")
-                    gtrans = await gtranslate_brief_ko(title_en, article_text)
-                display_title = title_ko or title_en
-
-                pairs = extract_country_pairs(title_en, article_text)
+                pairs = extract_country_pairs(title, article_text)
                 if pairs:
                     for a, b in pairs:
                         key = f"{a} | {b}"
@@ -752,30 +710,24 @@ async def run_once():
 
                         risk_events.append({
                             "pub": pub.isoformat(),
-                            "title": display_title,  # ✅ 프론트 표시용(한국어)
-                            "title_en": title_en,
-                            "title_ko": title_ko,
+                            "title": title,
                             "link": link,
                             "key": key,
                             "score": float(score),
                             "band": band,
                             "signals": json.dumps(signals, ensure_ascii=False),
-                            "gtrans": gtrans
                         })
                 else:
                     score = compute_risk_score(signals, hours_ago, 0.0)
                     band = band_from_score(score)
                     risk_events.append({
                         "pub": pub.isoformat(),
-                        "title": display_title,  # ✅ 프론트 표시용(한국어)
-                        "title_en": title_en,
-                        "title_ko": title_ko,
+                        "title": title,
                         "link": link,
                         "key": "미상",
                         "score": float(score),
                         "band": band,
                         "signals": json.dumps(signals, ensure_ascii=False),
-                        "gtrans": gtrans
                     })
 
                 seen_fp_expiry[fp] = now + timedelta(hours=DEDUP_HOURS)
@@ -784,8 +736,6 @@ async def run_once():
                 continue
 
     return ews_events, risk_events
-
-
 
 
 
